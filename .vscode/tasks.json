@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: g++.exe 生成活动文件",
+            "command": "C:/msys64/mingw64/bin/g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${workspaceFolder}/main.cpp",
+                "${workspaceFolder}/data.cpp",
+                "${workspaceFolder}/scanner.cpp",
+                "${workspaceFolder}/actions.cpp",
+                "${workspaceFolder}/ui_theme.cpp",
+                "${workspaceFolder}/ui_window.cpp",
+                "-o", "${workspaceFolder}/PortScanner.exe",
+                "-std=c++17",
+                "-mwindows",
+                "-municode",
+                "-lws2_32",
+                "-liphlpapi",
+                "-lgdi32",
+                "-lcomctl32",
+                "-lshell32",
+                "-lole32"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": ["$gcc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "编译器: C:/msys64/mingw64/bin/g++.exe"
+        }
+    ]
+}
