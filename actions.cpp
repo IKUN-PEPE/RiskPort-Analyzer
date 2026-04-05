@@ -15,8 +15,75 @@
 #include "actions.h"
 #include <shellapi.h>
 #include <shlobj.h>
+#include <vector>
+#include <string>
 
 #pragma comment(lib, "shell32.lib")
+
+static std::wstring MakeFirewallRuleName(const ActivePort& ap) {
+    wchar_t ruleName[64];
+    swprintf_s(ruleName, L"PortScanner_Block_%s_%d", ap.proto.c_str(), ap.port);
+    return ruleName;
+}
+
+static bool RunCommandCapture(const std::wstring& command, std::wstring& output) {
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE readPipe = nullptr, writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmdline = L"cmd.exe /c " + command;
+    BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(writePipe);
+    if (!ok) {
+        CloseHandle(readPipe);
+        return false;
+    }
+
+    std::string bytes;
+    char buffer[4096];
+    DWORD read = 0;
+    while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+        bytes.append(buffer, buffer + read);
+    }
+
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(readPipe);
+
+    if (bytes.size() >= 2 && (unsigned char)bytes[0] == 0xFF && (unsigned char)bytes[1] == 0xFE) {
+        output.assign(reinterpret_cast<const wchar_t*>(bytes.data() + 2),
+                      (bytes.size() - 2) / sizeof(wchar_t));
+    } else {
+        int len = MultiByteToWideChar(CP_OEMCP, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+        if (len <= 0) return false;
+        output.resize(len);
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.c_str(), (int)bytes.size(), output.data(), len);
+    }
+    return true;
+}
+
+static bool ContainsInsensitive(const std::wstring& text, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    std::wstring hay = text;
+    std::wstring ndl = needle;
+    CharUpperBuffW(hay.data(), (DWORD)hay.size());
+    CharUpperBuffW(ndl.data(), (DWORD)ndl.size());
+    return hay.find(ndl) != std::wstring::npos;
+}
 
 // ───────────────────────────────────────────────────────────
 //  受保护进程黑名单（终止这些进程会导致蓝屏或系统崩溃）
@@ -39,6 +106,56 @@ bool IsProtectedProcess(DWORD pid, const std::wstring& processName) {
         if (_wcsicmp(processName.c_str(), PROTECTED_NAMES[i]) == 0)
             return true;
     return false;
+}
+
+FirewallGlobalState QueryFirewallGlobalState() {
+    std::wstring output;
+    if (!RunCommandCapture(L"netsh advfirewall show allprofiles state", output))
+        return FW_GLOBAL_UNKNOWN;
+    if (ContainsInsensitive(output, L"OFF") || ContainsInsensitive(output, L"关闭"))
+        return FW_GLOBAL_OFF;
+    if (ContainsInsensitive(output, L"ON") || ContainsInsensitive(output, L"开启"))
+        return FW_GLOBAL_ON;
+    return FW_GLOBAL_UNKNOWN;
+}
+
+std::wstring FirewallGlobalStateStr(FirewallGlobalState s) {
+    switch (s) {
+    case FW_GLOBAL_ON:  return L"已开启";
+    case FW_GLOBAL_OFF: return L"已关闭";
+    default:            return L"未知";
+    }
+}
+
+FirewallBlockState QueryFirewallBlockState(const ActivePort& ap) {
+    if (ap.proto != L"TCP" && ap.proto != L"UDP") return FW_BLOCK_UNKNOWN;
+
+    std::wstring output;
+    std::wstring ruleName = MakeFirewallRuleName(ap);
+    wchar_t cmd[256];
+    swprintf_s(cmd,
+        L"netsh advfirewall firewall show rule name=\"%s\" verbose",
+        ruleName.c_str());
+
+    if (!RunCommandCapture(cmd, output)) return FW_BLOCK_UNKNOWN;
+    if (!ContainsInsensitive(output, ruleName)) return FW_BLOCK_NO;
+
+    std::wstring enabledYes = L"Yes";
+    std::wstring enabledCn = L"是";
+    if ((ContainsInsensitive(output, L"Enabled") || ContainsInsensitive(output, L"已启用")) &&
+        !(ContainsInsensitive(output, enabledYes) || ContainsInsensitive(output, enabledCn))) {
+        return FW_BLOCK_NO;
+    }
+
+    return FW_BLOCK_YES;
+}
+
+std::wstring FirewallBlockStateStr(FirewallBlockState s) {
+    switch (s) {
+    case FW_BLOCK_YES: return L"🛡 已封堵";
+    case FW_BLOCK_NO:  return L"⚠ 未封堵";
+    default:           return L"? 未知";
+    }
 }
 
 // ───────────────────────────────────────────────────────────
@@ -108,23 +225,28 @@ void ActionClosePort(HWND hParent, const ActivePort& ap) {
 // ───────────────────────────────────────────────────────────
 //  添加 Windows 防火墙入站阻断规则
 // ───────────────────────────────────────────────────────────
-void ActionAddFirewallBlock(HWND hParent, const ActivePort& ap) {
+bool ActionAddFirewallBlock(HWND hParent, const ActivePort& ap) {
     // proto 白名单校验，防止命令注入
     if (ap.proto != L"TCP" && ap.proto != L"UDP") {
         MessageBoxW(hParent, L"不支持的协议类型，操作取消。",
                     L"错误", MB_ICONERROR | MB_OK);
-        return;
+        return false;
     }
 
-    // 规则名只含整数端口和白名单协议，无注入风险
-    wchar_t ruleName[64];
-    swprintf_s(ruleName, L"PortScanner_Block_%s_%d", ap.proto.c_str(), ap.port);
+    if (QueryFirewallBlockState(ap) == FW_BLOCK_YES) {
+        MessageBoxW(hParent,
+            L"已检测到本工具创建的防火墙拦截规则，无需重复添加。",
+            L"规则已存在", MB_ICONINFORMATION | MB_OK);
+        return false;
+    }
+
+    std::wstring ruleName = MakeFirewallRuleName(ap);
 
     wchar_t cmd[320];
     swprintf_s(cmd,
         L"netsh advfirewall firewall add rule "
         L"name=\"%s\" dir=in action=block protocol=%s localport=%d",
-        ruleName, ap.proto.c_str(), ap.port);
+        ruleName.c_str(), ap.proto.c_str(), ap.port);
 
     wchar_t params[384];
     swprintf_s(params, L"/c %s", cmd);
@@ -145,16 +267,153 @@ void ActionAddFirewallBlock(HWND hParent, const ActivePort& ap) {
             L"注意：规则仅拦截新入站连接，\n"
             L"不会中断已建立的连接，也不会终止监听进程。",
             L"防火墙规则已添加", MB_ICONINFORMATION | MB_OK);
+        return true;
     } else {
         DWORD err = GetLastError();
         if (err == ERROR_CANCELLED) {
             // 用户取消了 UAC 提权，静默忽略
-            return;
+            return false;
         }
         wchar_t errMsg[200];
         swprintf_s(errMsg,
             L"添加防火墙规则失败（错误码：%lu）。\n"
             L"请以管理员身份运行本程序后重试。", err);
         MessageBoxW(hParent, errMsg, L"操作失败", MB_ICONERROR | MB_OK);
+        return false;
+    }
+}
+
+bool ActionRemoveFirewallBlock(HWND hParent, const ActivePort& ap) {
+    if (ap.proto != L"TCP" && ap.proto != L"UDP") {
+        MessageBoxW(hParent, L"不支持的协议类型，操作取消。",
+                    L"错误", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    if (QueryFirewallBlockState(ap) != FW_BLOCK_YES) {
+        MessageBoxW(hParent,
+            L"当前没有检测到本工具创建的防火墙拦截规则。",
+            L"无需去除", MB_ICONINFORMATION | MB_OK);
+        return false;
+    }
+
+    wchar_t msg[512];
+    swprintf_s(msg,
+        L"确认要去除端口 %d（%s）的防火墙拦截规则吗？\n\n"
+        L"这将删除本工具创建的对应入站阻断规则。",
+        ap.port, ap.proto.c_str());
+
+    if (MessageBoxW(hParent, msg, L"确认去除拦截",
+                    MB_YESNO | MB_ICONWARNING) != IDYES)
+        return false;
+
+    std::wstring ruleName = MakeFirewallRuleName(ap);
+    wchar_t cmd[320];
+    swprintf_s(cmd,
+        L"netsh advfirewall firewall delete rule name=\"%s\"",
+        ruleName.c_str());
+
+    wchar_t params[384];
+    swprintf_s(params, L"/c %s", cmd);
+
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"cmd.exe";
+    sei.lpParameters = params;
+    sei.nShow = SW_HIDE;
+
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 8000);
+        CloseHandle(sei.hProcess);
+        MessageBoxW(hParent,
+            L"防火墙拦截规则已删除。\n\n"
+            L"点击「重新扫描」可刷新端口状态。",
+            L"操作成功", MB_ICONINFORMATION | MB_OK);
+        return true;
+    } else {
+        DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) return false;
+        wchar_t errMsg[200];
+        swprintf_s(errMsg,
+            L"删除防火墙规则失败（错误码：%lu）。\n"
+            L"请以管理员身份运行本程序后重试。", err);
+        MessageBoxW(hParent, errMsg, L"操作失败", MB_ICONERROR | MB_OK);
+        return false;
+    }
+}
+
+bool ActionEnableFirewall(HWND hParent) {
+    FirewallGlobalState state = QueryFirewallGlobalState();
+    if (state == FW_GLOBAL_ON) {
+        MessageBoxW(hParent,
+            L"检测到 Windows 防火墙已开启，无需重复打开。",
+            L"提示", MB_ICONINFORMATION | MB_OK);
+        return false;
+    }
+
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"cmd.exe";
+    sei.lpParameters = L"/c netsh advfirewall set allprofiles state on";
+    sei.nShow = SW_HIDE;
+
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 8000);
+        CloseHandle(sei.hProcess);
+        MessageBoxW(hParent,
+            L"Windows 防火墙已尝试开启成功。\n\n"
+            L"建议你重新扫描端口，并根据需要继续添加拦截规则。",
+            L"操作成功", MB_ICONINFORMATION | MB_OK);
+        return true;
+    } else {
+        DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) return false;
+        wchar_t errMsg[200];
+        swprintf_s(errMsg,
+            L"开启 Windows 防火墙失败（错误码：%lu）。\n"
+            L"请尝试以管理员身份运行本程序。", err);
+        MessageBoxW(hParent, errMsg, L"操作失败", MB_ICONERROR | MB_OK);
+        return false;
+    }
+}
+
+bool ActionDisableFirewall(HWND hParent) {
+    FirewallGlobalState state = QueryFirewallGlobalState();
+    if (state == FW_GLOBAL_OFF) {
+        MessageBoxW(hParent,
+            L"检测到 Windows 防火墙已关闭，无需重复关闭。",
+            L"提示", MB_ICONINFORMATION | MB_OK);
+        return false;
+    }
+
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"cmd.exe";
+    sei.lpParameters = L"/c netsh advfirewall set allprofiles state off";
+    sei.nShow = SW_HIDE;
+
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 8000);
+        CloseHandle(sei.hProcess);
+        MessageBoxW(hParent,
+            L"Windows 防火墙已尝试关闭成功。\n\n"
+            L"建议你重新扫描端口，确认整体状态变化。",
+            L"操作成功", MB_ICONINFORMATION | MB_OK);
+        return true;
+    } else {
+        DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) return false;
+        wchar_t errMsg[200];
+        swprintf_s(errMsg,
+            L"关闭 Windows 防火墙失败（错误码：%lu）。\n"
+            L"请尝试以管理员身份运行本程序。", err);
+        MessageBoxW(hParent, errMsg, L"操作失败", MB_ICONERROR | MB_OK);
+        return false;
     }
 }

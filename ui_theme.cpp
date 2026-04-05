@@ -150,6 +150,10 @@ void Theme_DrawBanner(HDC hdc, const RECT& cr) {
 void Theme_DrawToolbar(HDC hdc, const RECT& cr) {
     int W = cr.right - cr.left;
     FillRect(hdc, 0, TOOLBAR_Y, W, TOOLBAR_H, C_BG_TOOLBAR);
+
+    // 第一行和第二行之间的细分隔线
+    FillRect(hdc, 0, TOOLBAR_Y + 52, W, 1, C_BORDER_BRIGHT);
+
     // 底部细线
     FillRect(hdc, 0, TOOLBAR_Y + TOOLBAR_H - 1, W, 1, C_BORDER);
 }

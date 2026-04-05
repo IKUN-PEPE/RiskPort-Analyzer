@@ -14,6 +14,7 @@
 
 #include "scanner.h"
 #include "resource.h"
+#include "actions.h"
 #include <winsock2.h>   // ← 必须第一个
 #include <ws2tcpip.h>
 #include <windows.h>    // ← 在 winsock2 之后
@@ -79,6 +80,7 @@ std::vector<ActivePort> ScanPorts() {
         ap.pid         = pid;
         ap.processName = PidToName(pidMap, pid);
         ap.info        = FindPortInfo(port, proto);
+        ap.firewallBlockState = ap.info ? QueryFirewallBlockState(ap) : FW_BLOCK_UNKNOWN;
         results.push_back(ap);
     };
 

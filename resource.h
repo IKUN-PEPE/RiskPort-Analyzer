@@ -12,7 +12,13 @@
 #define IDC_DETAIL_EDIT     104
 #define IDC_RADIO_DANGER    105
 #define IDC_RADIO_ALL       106
+#define IDC_BTN_FW_ENABLE   107
 #define IDC_STATUSBAR       108
+#define IDC_BTN_FW_REMOVE   109
+#define IDC_BTN_EXPORT      110
+#define IDC_EDIT_SEARCH     111
+#define IDC_STATIC_SEARCH   112
+#define IDC_BTN_FW_DISABLE  113
 
 // ── 自定义消息 ──────────────────────────────────────────────
 #define WM_SCAN_DONE        (WM_USER + 1)   // 扫描线程完成
@@ -61,38 +67,50 @@
 // ═══════════════════════════════════════════════════════════
 
 // 顶部 Banner 高度
-#define BANNER_H            60
+#define BANNER_H            52
 
-// 工具栏（按钮行）参数
-#define TOOLBAR_H           56
+// 工具栏（两行）参数
+#define TOOLBAR_H           112
 #define TOOLBAR_Y           BANNER_H          // Banner 正下方
 
-// 按钮尺寸
-#define BTN_H               36
+// 第一行主操作按钮
+#define BTN_H               40
 #define BTN_RADIUS          6                 // 圆角半径
-#define BTN_SCAN_X          14
-#define BTN_SCAN_W          136
-#define BTN_CLOSE_X         162
-#define BTN_CLOSE_W         220
-#define BTN_FW_X            394
-#define BTN_FW_W            190
-#define BTN_Y_OFFSET        10                // 按钮在工具栏内的垂直偏移
+#define BTN_SCAN_X          16
+#define BTN_SCAN_W          112
+#define BTN_CLOSE_X         140
+#define BTN_CLOSE_W         128
+#define BTN_FW_X            280
+#define BTN_FW_W            128
+#define BTN_FW_REMOVE_X     420
+#define BTN_FW_REMOVE_W     128
+#define BTN_FW_ENABLE_X     560
+#define BTN_FW_ENABLE_W     120
+#define BTN_FW_DISABLE_X    692
+#define BTN_FW_DISABLE_W    120
+#define BTN_EXPORT_X        824
+#define BTN_EXPORT_W        108
+#define BTN_Y_OFFSET        8                 // 第一行按钮偏移
 
-// 单选按钮
-#define RADIO_DANGER_X      600
-#define RADIO_ALL_X         760
-#define RADIO_W             148
-#define RADIO_Y_OFFSET      18
+// 第二行筛选 / 搜索
+#define RADIO_DANGER_X      24
+#define RADIO_ALL_X         156
+#define RADIO_W             118
+#define RADIO_Y_OFFSET      66
+#define SEARCH_X            700
+#define SEARCH_Y_OFFSET     64
+#define SEARCH_W            360
+#define SEARCH_H            28
 
 // ListView 上边距（相对于客户区）
-#define LIST_TOP            (BANNER_H + TOOLBAR_H + 4)
+#define LIST_TOP            (BANNER_H + TOOLBAR_H + 6)
 
 // 详情面板高度（底部固定）
-#define DETAIL_H            185
+#define DETAIL_H            152
 
 // 最小窗口尺寸
-#define MIN_WIN_W           680
-#define MIN_WIN_H           560
+#define MIN_WIN_W           1220
+#define MIN_WIN_H           620
 
 // ═══════════════════════════════════════════════════════════
 //  字体参数

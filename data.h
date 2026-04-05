@@ -21,6 +21,12 @@ enum RiskLevel {
     RISK_MEDIUM,         // 中危
 };
 
+enum FirewallBlockState {
+    FW_BLOCK_UNKNOWN = 0,
+    FW_BLOCK_NO,
+    FW_BLOCK_YES,
+};
+
 // ── 高危端口描述记录 ────────────────────────────────────────
 struct PortInfo {
     int          port;
@@ -39,6 +45,7 @@ struct ActivePort {
     DWORD           pid;
     std::wstring    processName;
     const PortInfo* info;      // nullptr = 不在高危库中
+    FirewallBlockState firewallBlockState;
 };
 
 // ── 全局高危端口数据库（定义在 data.cpp）─────────────────

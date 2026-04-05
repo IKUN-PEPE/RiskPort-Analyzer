@@ -24,6 +24,9 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>  // ← 添加这行（GET_X_LPARAM / GET_Y_LPARAM）
+#include <algorithm>
+#include <fstream>
+#include <ctime>
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -34,22 +37,156 @@ HWND g_hMainWnd    = nullptr;
 HWND g_hList       = nullptr;
 HWND g_hDetailEdit = nullptr;
 HWND g_hStatusBar  = nullptr;
+static HWND g_hSearchEdit = nullptr;
 
 bool g_showAll  = false;
 bool g_scanning = false;
+FirewallGlobalState g_firewallGlobalState = FW_GLOBAL_UNKNOWN;
+bool g_searchPlaceholderActive = true;
 
 std::vector<ActivePort> g_results;
+std::vector<int> g_viewIndices;
+std::wstring g_searchText;
+int g_sortColumn = 0;
+bool g_sortAscending = true;
+
+static std::wstring ToSearchableText(const ActivePort& ap) {
+    std::wstring text = std::to_wstring(ap.port) + L" " + ap.proto + L" " + ap.state + L" "
+        + std::to_wstring(ap.pid) + L" " + ap.processName;
+    if (ap.info) {
+        text += L" " + ap.info->service + L" " + RiskLevelStr(ap.info->risk);
+    }
+    return text;
+}
+
+static bool ContainsInsensitiveText(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    std::wstring h = haystack, n = needle;
+    CharUpperBuffW(h.data(), (DWORD)h.size());
+    CharUpperBuffW(n.data(), (DWORD)n.size());
+    return h.find(n) != std::wstring::npos;
+}
+
+static int RiskSortValue(const ActivePort& ap) {
+    if (!ap.info) return 99;
+    return (int)ap.info->risk;
+}
+
+static void BuildViewIndices() {
+    g_viewIndices.clear();
+    for (int idx = 0; idx < (int)g_results.size(); ++idx) {
+        const ActivePort& ap = g_results[idx];
+        if (!g_showAll && !ap.info) continue;
+        if (!ContainsInsensitiveText(ToSearchableText(ap), g_searchText)) continue;
+        g_viewIndices.push_back(idx);
+    }
+
+    auto cmp = [](int aIdx, int bIdx) {
+        const ActivePort& a = g_results[aIdx];
+        const ActivePort& b = g_results[bIdx];
+        int result = 0;
+        switch (g_sortColumn) {
+        case 0: result = a.port - b.port; break;
+        case 1: result = a.proto.compare(b.proto); break;
+        case 2: result = a.state.compare(b.state); break;
+        case 3: result = (a.info ? a.info->service : L"—").compare(b.info ? b.info->service : L"—"); break;
+        case 4: result = RiskSortValue(a) - RiskSortValue(b); break;
+        case 5: result = (int)a.firewallBlockState - (int)b.firewallBlockState; break;
+        case 6: result = (a.pid < b.pid) ? -1 : (a.pid > b.pid ? 1 : 0); break;
+        case 7: result = a.processName.compare(b.processName); break;
+        default: result = a.port - b.port; break;
+        }
+        if (result == 0) result = a.port - b.port;
+        return g_sortAscending ? (result < 0) : (result > 0);
+    };
+
+    std::sort(g_viewIndices.begin(), g_viewIndices.end(), cmp);
+}
+
+static void ExportCurrentViewCsv(HWND hWnd) {
+    wchar_t fileName[MAX_PATH] = L"port_scan_report.csv";
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hWnd;
+    ofn.lpstrFilter = L"CSV Files (*.csv)\0*.csv\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"csv";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    std::ofstream out(ofn.lpstrFile, std::ios::binary);
+    if (!out) {
+        MessageBoxW(hWnd, L"导出文件失败，无法写入目标路径。", L"导出失败", MB_ICONERROR | MB_OK);
+        return;
+    }
+
+    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    out.write((const char*)bom, 3);
+
+    auto writeUtf8Line = [&](const std::wstring& line) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string buf(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, buf.data(), len, nullptr, nullptr);
+        out << buf << "\r\n";
+    };
+    auto csv = [](std::wstring s) {
+        size_t pos = 0;
+        while ((pos = s.find(L'"', pos)) != std::wstring::npos) {
+            s.insert(pos, L"\"");
+            pos += 2;
+        }
+        return L"\"" + s + L"\"";
+    };
+
+    writeUtf8Line(L"端口,协议,状态,服务名,风险等级,防火墙状态,PID,进程名,危险描述,修复建议");
+    for (int idx : g_viewIndices) {
+        const ActivePort& ap = g_results[idx];
+        std::wstring line =
+            csv(std::to_wstring(ap.port)) + L"," +
+            csv(ap.proto) + L"," +
+            csv(ap.state) + L"," +
+            csv(ap.info ? ap.info->service : L"—") + L"," +
+            csv(ap.info ? RiskLevelStr(ap.info->risk) : L"正常") + L"," +
+            csv(FirewallBlockStateStr(ap.firewallBlockState)) + L"," +
+            csv(std::to_wstring(ap.pid)) + L"," +
+            csv(ap.processName) + L"," +
+            csv(ap.info ? ap.info->description : L"") + L"," +
+            csv(ap.info ? ap.info->mitigation : L"");
+        writeUtf8Line(line);
+    }
+
+    MessageBoxW(hWnd, L"扫描报告已成功导出为 CSV。", L"导出成功", MB_ICONINFORMATION | MB_OK);
+}
+
+static void UpdateFirewallButtonState() {
+    HWND hBtn = GetDlgItem(g_hMainWnd, IDC_BTN_FW_ENABLE);
+    if (!hBtn) return;
+
+    if (g_firewallGlobalState == FW_GLOBAL_ON) {
+        SetWindowTextW(hBtn, L"  ✅  防火墙已开启");
+        EnableWindow(hBtn, FALSE);
+    } else {
+        SetWindowTextW(hBtn, L"  🔓  打开防火墙");
+        EnableWindow(hBtn, TRUE);
+    }
+}
+
+static void TriggerRescan() {
+    if (!g_scanning && g_hMainWnd)
+        PostMessageW(g_hMainWnd, WM_COMMAND, IDC_BTN_SCAN, 0);
+}
 
 // ───────────────────────────────────────────────────────────
 //  ListView 填充
 // ───────────────────────────────────────────────────────────
 void Window_RefreshList() {
     ListView_DeleteAllItems(g_hList);
+    BuildViewIndices();
     int row = 0;
 
-    for (int idx = 0; idx < (int)g_results.size(); ++idx) {
+    for (int idx : g_viewIndices) {
         const ActivePort& ap = g_results[idx];
-        if (!g_showAll && !ap.info) continue;   // 过滤非高危
 
         LVITEMW lvi  = {};
         lvi.mask     = LVIF_TEXT | LVIF_PARAM;
@@ -61,24 +198,22 @@ void Window_RefreshList() {
         lvi.pszText = portBuf;
         ListView_InsertItem(g_hList, &lvi);
 
-        // 协议
         ListView_SetItemText(g_hList, row, 1, (LPWSTR)ap.proto.c_str());
-        // 状态
         ListView_SetItemText(g_hList, row, 2, (LPWSTR)ap.state.c_str());
-        // 服务名 / 风险
         if (ap.info) {
             ListView_SetItemText(g_hList, row, 3, (LPWSTR)ap.info->service.c_str());
             ListView_SetItemText(g_hList, row, 4, (LPWSTR)RiskLevelStr(ap.info->risk).c_str());
+            ListView_SetItemText(g_hList, row, 5, (LPWSTR)FirewallBlockStateStr(ap.firewallBlockState).c_str());
         } else {
             wchar_t dash[] = L"—", norm[] = L"正常";
             ListView_SetItemText(g_hList, row, 3, dash);
             ListView_SetItemText(g_hList, row, 4, norm);
+            ListView_SetItemText(g_hList, row, 5, dash);
         }
-        // PID / 进程名
         wchar_t pidBuf[16];
         swprintf_s(pidBuf, L"%lu", ap.pid);
-        ListView_SetItemText(g_hList, row, 5, pidBuf);
-        ListView_SetItemText(g_hList, row, 6, (LPWSTR)ap.processName.c_str());
+        ListView_SetItemText(g_hList, row, 6, pidBuf);
+        ListView_SetItemText(g_hList, row, 7, (LPWSTR)ap.processName.c_str());
 
         ++row;
     }
@@ -118,7 +253,8 @@ void Window_ShowDetail() {
 
     if (ap->info) {
         t += L"  服务    : " + ap->info->service + L"\r\n";
-        t += L"  风险等级: " + RiskLevelStr(ap->info->risk) + L"\r\n\r\n";
+        t += L"  风险等级: " + RiskLevelStr(ap->info->risk) + L"\r\n";
+        t += L"  防火墙  : " + FirewallBlockStateStr(ap->firewallBlockState) + L"\r\n\r\n";
         t += L"  【危险描述】\r\n  " + ap->info->description + L"\r\n\r\n";
         t += L"  【修复建议】\r\n  " + ap->info->mitigation + L"\r\n";
     } else {
@@ -140,11 +276,15 @@ static void CreateControls(HWND hWnd, HINSTANCE hInst) {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
             x, toolY, w, BTN_H, hWnd, (HMENU)(UINT_PTR)id, hInst, nullptr);
     };
-    makeBtn(L"  🔍  重新扫描",         BTN_SCAN_X,  BTN_SCAN_W,  IDC_BTN_SCAN);
-    makeBtn(L"  ⛔  关闭端口（终止进程）", BTN_CLOSE_X, BTN_CLOSE_W, IDC_BTN_CLOSE);
-    makeBtn(L"  🛡  添加防火墙拦截",    BTN_FW_X,    BTN_FW_W,    IDC_BTN_FW);
+    makeBtn(L"  🔍  扫描",          BTN_SCAN_X,  BTN_SCAN_W,  IDC_BTN_SCAN);
+    makeBtn(L"  ⛔  关端口",        BTN_CLOSE_X, BTN_CLOSE_W, IDC_BTN_CLOSE);
+    makeBtn(L"  🛡  加拦截",        BTN_FW_X,    BTN_FW_W,    IDC_BTN_FW);
+    makeBtn(L"  🧹  去拦截",        BTN_FW_REMOVE_X, BTN_FW_REMOVE_W, IDC_BTN_FW_REMOVE);
+    makeBtn(L"  🔓  防火墙开",      BTN_FW_ENABLE_X, BTN_FW_ENABLE_W, IDC_BTN_FW_ENABLE);
+    makeBtn(L"  🔒  防火墙关",      BTN_FW_DISABLE_X, BTN_FW_DISABLE_W, IDC_BTN_FW_DISABLE);
+    makeBtn(L"  📄  导出",          BTN_EXPORT_X, BTN_EXPORT_W, IDC_BTN_EXPORT);
 
-    // ── 单选按钮 ───────────────────────────────────────────
+    // ── 第二行筛选 / 搜索 ───────────────────────────────
     int radioY = TOOLBAR_Y + RADIO_Y_OFFSET;
     CreateWindowW(L"BUTTON", L"仅高危端口",
         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
@@ -152,8 +292,16 @@ static void CreateControls(HWND hWnd, HINSTANCE hInst) {
         hWnd, (HMENU)IDC_RADIO_DANGER, hInst, nullptr);
     CreateWindowW(L"BUTTON", L"显示全部",
         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_TABSTOP,
-        RADIO_ALL_X, radioY, 100, 22,
+        RADIO_ALL_X, radioY, 112, 22,
         hWnd, (HMENU)IDC_RADIO_ALL, hInst, nullptr);
+    CreateWindowW(L"STATIC", L"搜索",
+        WS_CHILD | WS_VISIBLE,
+        SEARCH_X - 58, TOOLBAR_Y + SEARCH_Y_OFFSET + 2, 48, 22,
+        hWnd, (HMENU)IDC_STATIC_SEARCH, hInst, nullptr);
+    g_hSearchEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"输入端口 / 服务 / 进程名搜索",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        SEARCH_X, TOOLBAR_Y + SEARCH_Y_OFFSET, SEARCH_W, SEARCH_H,
+        hWnd, (HMENU)IDC_EDIT_SEARCH, hInst, nullptr);
     CheckRadioButton(hWnd, IDC_RADIO_DANGER, IDC_RADIO_ALL, IDC_RADIO_DANGER);
 
     // ── ListView ───────────────────────────────────────────
@@ -173,11 +321,11 @@ static void CreateControls(HWND hWnd, HINSTANCE hInst) {
     // 列定义
     struct ColDef { const wchar_t* name; int width; };
     static const ColDef cols[] = {
-        {L"端口",  70}, {L"协议",  62}, {L"状态",  105},
-        {L"服务名",145}, {L"风险",  80}, {L"PID",   68},
-        {L"进程名",200}
+        {L"端口",  76}, {L"协议",  72}, {L"状态",  112},
+        {L"服务名",170}, {L"风险",  84}, {L"防火墙", 120}, {L"PID",   72},
+        {L"进程名",250}
     };
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
         LVCOLUMNW lvc = {};
         lvc.mask    = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT;
         lvc.fmt     = LVCFMT_LEFT;
@@ -244,6 +392,10 @@ static void OnSize(HWND hWnd, int w, int h) {
         SetWindowPos(g_hList, nullptr, 0, listTop,
                      w, listH, SWP_NOZORDER | SWP_NOACTIVATE);
 
+    if (g_hSearchEdit)
+        SetWindowPos(g_hSearchEdit, nullptr, SEARCH_X, TOOLBAR_Y + SEARCH_Y_OFFSET,
+                     SEARCH_W, SEARCH_H, SWP_NOZORDER | SWP_NOACTIVATE);
+
     if (g_hDetailEdit)
         SetWindowPos(g_hDetailEdit, nullptr, 0, detailTop,
                      w, DETAIL_H, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -257,6 +409,8 @@ static void OnScanDone(LPARAM lParam) {
     g_results  = std::move(*res);
     delete res;
 
+    g_firewallGlobalState = QueryFirewallGlobalState();
+
     int total = (int)g_results.size();
     int danger = 0, critical = 0;
     for (const auto& r : g_results) {
@@ -267,14 +421,22 @@ static void OnScanDone(LPARAM lParam) {
     }
 
     Window_RefreshList();
+    UpdateFirewallButtonState();
+
+    if (ListView_GetItemCount(g_hList) > 0) {
+        ListView_SetItemState(g_hList, 0, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(g_hList, 0, FALSE);
+        Window_ShowDetail();
+    }
 
     wchar_t status[256];
     swprintf_s(status,
-        L"  扫描完成  |  共 %d 个监听端口  |  高危: %d  |  严重: %d",
-        total, danger, critical);
+        L"  扫描完成  |  共 %d 个监听端口  |  高危: %d  |  严重: %d  |  防火墙: %s",
+        total, danger, critical, FirewallGlobalStateStr(g_firewallGlobalState).c_str());
     SendMessageW(g_hStatusBar, SB_SETTEXTW, 0, (LPARAM)status);
 
-    wchar_t right[64];
+    wchar_t right[80];
     swprintf_s(right, L"  严重 %d  高危 %d", critical, danger - critical);
     SendMessageW(g_hStatusBar, SB_SETTEXTW, 1, (LPARAM)right);
 
@@ -289,7 +451,7 @@ static void TrackButtonHover(HWND hWnd, LPARAM lParam) {
     POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
     int newHover = -1;
 
-    for (int id : { IDC_BTN_SCAN, IDC_BTN_CLOSE, IDC_BTN_FW }) {
+    for (int id : { IDC_BTN_SCAN, IDC_BTN_CLOSE, IDC_BTN_FW, IDC_BTN_FW_REMOVE, IDC_BTN_FW_ENABLE, IDC_BTN_FW_DISABLE, IDC_BTN_EXPORT }) {
         HWND hBtn = GetDlgItem(hWnd, id);
         if (!hBtn) continue;
         RECT rc; GetWindowRect(hBtn, &rc);
@@ -300,7 +462,7 @@ static void TrackButtonHover(HWND hWnd, LPARAM lParam) {
     if (newHover != g_btnHover) {
         g_btnHover = newHover;
         // 重绘三个按钮
-        for (int id : { IDC_BTN_SCAN, IDC_BTN_CLOSE, IDC_BTN_FW }) {
+        for (int id : { IDC_BTN_SCAN, IDC_BTN_CLOSE, IDC_BTN_FW, IDC_BTN_FW_REMOVE, IDC_BTN_FW_ENABLE, IDC_BTN_FW_DISABLE, IDC_BTN_EXPORT }) {
             HWND hBtn = GetDlgItem(hWnd, id);
             if (hBtn) InvalidateRect(hBtn, nullptr, FALSE);
         }
@@ -326,6 +488,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HINSTANCE hInst = ((LPCREATESTRUCT)lParam)->hInstance;
         Theme_Init(hWnd);
         CreateControls(hWnd, hInst);
+        UpdateFirewallButtonState();
         PostMessageW(hWnd, WM_COMMAND, IDC_BTN_SCAN, 0);   // 启动时自动扫描
         return 0;
     }
@@ -353,7 +516,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_MOUSELEAVE:
         g_btnHover = -1;
-        for (int id : { IDC_BTN_SCAN, IDC_BTN_CLOSE, IDC_BTN_FW }) {
+        for (int id : { IDC_BTN_SCAN, IDC_BTN_CLOSE, IDC_BTN_FW, IDC_BTN_FW_REMOVE, IDC_BTN_FW_ENABLE, IDC_BTN_FW_DISABLE, IDC_BTN_EXPORT }) {
             HWND hBtn = GetDlgItem(hWnd, id);
             if (hBtn) InvalidateRect(hBtn, nullptr, FALSE);
         }
@@ -386,10 +549,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!ap)
                 MessageBoxW(hWnd, L"请先在列表中选择一个端口。",
                             L"提示", MB_ICONINFORMATION);
-            else
-                ActionAddFirewallBlock(hWnd, *ap);
+            else if (ActionAddFirewallBlock(hWnd, *ap))
+                TriggerRescan();
             break;
         }
+        case IDC_BTN_FW_REMOVE: {
+            ActivePort* ap = Window_GetSelectedPort();
+            if (!ap)
+                MessageBoxW(hWnd, L"请先在列表中选择一个端口。",
+                            L"提示", MB_ICONINFORMATION);
+            else if (ActionRemoveFirewallBlock(hWnd, *ap))
+                TriggerRescan();
+            break;
+        }
+        case IDC_BTN_FW_ENABLE:
+            if (ActionEnableFirewall(hWnd))
+                TriggerRescan();
+            break;
+        case IDC_BTN_FW_DISABLE:
+            if (ActionDisableFirewall(hWnd))
+                TriggerRescan();
+            break;
+        case IDC_BTN_EXPORT:
+            ExportCurrentViewCsv(hWnd);
+            break;
         case IDC_RADIO_DANGER:
             g_showAll = false;
             Window_RefreshList();
@@ -397,6 +580,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_RADIO_ALL:
             g_showAll = true;
             Window_RefreshList();
+            break;
+        case IDC_EDIT_SEARCH:
+            if ((HWND)lParam == g_hSearchEdit) {
+                if (HIWORD(wParam) == EN_SETFOCUS && g_searchPlaceholderActive) {
+                    SetWindowTextW(g_hSearchEdit, L"");
+                    g_searchPlaceholderActive = false;
+                } else if (HIWORD(wParam) == EN_CHANGE) {
+                    int len = GetWindowTextLengthW(g_hSearchEdit);
+                    g_searchText.resize(len);
+                    GetWindowTextW(g_hSearchEdit, g_searchText.data(), len + 1);
+                    if (g_searchPlaceholderActive) g_searchText.clear();
+                    Window_RefreshList();
+                }
+            }
             break;
         }
         return 0;
@@ -407,6 +604,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (hdr->idFrom == IDC_LISTVIEW) {
             if (hdr->code == NM_CUSTOMDRAW)
                 return Theme_ListCustomDraw(lParam, g_results);
+            if (hdr->code == LVN_COLUMNCLICK) {
+                auto* lv = reinterpret_cast<NMLISTVIEW*>(lParam);
+                if (g_sortColumn == lv->iSubItem) g_sortAscending = !g_sortAscending;
+                else {
+                    g_sortColumn = lv->iSubItem;
+                    g_sortAscending = true;
+                }
+                Window_RefreshList();
+            }
             if (hdr->code == NM_CLICK || hdr->code == LVN_ITEMCHANGED)
                 Window_ShowDetail();
         }
@@ -460,7 +666,7 @@ HWND Window_Create(HINSTANCE hInst, int nShow) {
         L"PortScannerWnd",
         L"高危端口检测与管理  v3.0",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 980, 720,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1220, 720,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(hWnd, nShow);

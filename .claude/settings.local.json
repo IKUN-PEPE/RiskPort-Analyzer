@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(g++:*)",
+      "Bash(/c/msys64/mingw64/bin/g++:*)"
+    ]
+  }
+}

@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include "data.h"
+#include "actions.h"
 #include <vector>
 
 // ── 全局窗口句柄 ────────────────────────────────────────────
@@ -24,8 +25,16 @@ extern HWND g_hStatusBar;
 extern bool g_showAll;    // true = 全部端口，false = 仅高危
 extern bool g_scanning;   // 正在扫描中
 
-// ── 当前扫描结果 ────────────────────────────────────────────
+// 全局防火墙状态
+extern FirewallGlobalState g_firewallGlobalState;
+extern bool g_searchPlaceholderActive;
+
+// ── 当前扫描结果 / 视图状态 ─────────────────────────────────
 extern std::vector<ActivePort> g_results;
+extern std::vector<int> g_viewIndices;
+extern std::wstring g_searchText;
+extern int g_sortColumn;
+extern bool g_sortAscending;
 
 // 注册并创建主窗口
 HWND Window_Create(HINSTANCE hInst, int nShow);
